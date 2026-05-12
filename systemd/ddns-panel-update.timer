@@ -1,0 +1,11 @@
+[Unit]
+Description=DDNS Panel Update Timer
+
+[Timer]
+OnBootSec=120s
+OnUnitActiveSec=5min
+Unit=ddns-panel-update.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

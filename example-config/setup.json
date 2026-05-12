@@ -1,0 +1,22 @@
+{
+  "interval_minutes": 5,
+  "boot_delay_seconds": 120,
+  "request_timeout_seconds": 5,
+  "retry_count": 2,
+  "retry_delay_seconds": 3,
+  "only_update_on_change": true,
+  "log_lines": 40,
+  "ipv4_sources": [
+    "https://api.ipify.org",
+    "https://ifconfig.me/ip",
+    "https://ipv4.icanhazip.com"
+  ],
+  "ipv6_sources": [
+    "https://api6.ipify.org",
+    "https://ipv6.icanhazip.com"
+  ],
+  "mdns_enabled": true,
+  "mdns_hostname": "ddns-panel.local",
+  "local_proxy_enabled": true,
+  "panel_port": 5085
+}

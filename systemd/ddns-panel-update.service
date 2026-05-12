@@ -1,0 +1,11 @@
+[Unit]
+Description=DDNS Panel Update Run
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/ddns-panel
+Environment=PYTHONPATH=/opt/ddns-panel
+ExecStart=/opt/ddns-panel/venv/bin/python /opt/ddns-panel/ddns-panel-update.py --once
