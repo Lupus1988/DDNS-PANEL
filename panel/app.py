@@ -23,6 +23,7 @@ from lib.ddns_core import (
     SESSION_TIMEOUT_MINUTES,
     build_update_command,
     delete_entry_secret,
+    entry_hostnames,
     ensure_runtime_layout,
     find_entry,
     get_entry_secret,
@@ -33,6 +34,7 @@ from lib.ddns_core import (
     load_setup,
     load_status,
     now_iso,
+    normalize_hostnames,
     remove_panel_runtime,
     run_panel_update,
     save_entries,
@@ -1232,6 +1234,21 @@ PROVIDER_SPECS = {
         "update_error": "Bitte den ddnss.de-Benutzernamen eingeben.",
         "supported_ip_modes": ["ipv4", "ipv6", "dual"],
     },
+    "netcup_rest": {
+        "label": "Netcup REST API",
+        "hostname_placeholder": "z. B. mail.knittel-cloud.de",
+        "username_label": "Benutzername",
+        "password_label": "Netcup API-Key",
+        "show_username": False,
+        "require_username": False,
+        "help": "Für Netcup wird nur der neue API-Key benötigt. Der Key wird geschützt auf dem Server gespeichert; keine Legacy-API verwenden.",
+        "ip_mode_help": {
+            "ipv4": "IPv4 aktualisiert den passenden A-Record in deiner Netcup-DNS-Zone.",
+        },
+        "create_error": "Bitte den Netcup API-Key eingeben.",
+        "update_error": "Bitte den Netcup API-Key eingeben.",
+        "supported_ip_modes": ["ipv4"],
+    },
     "cloudflare": {
         "label": "Cloudflare",
         "hostname_placeholder": "z. B. home.example.com",
@@ -1872,6 +1889,7 @@ def index():
         entry_status = status["entries"].get(entry["id"], {})
         badge_class = "online" if entry_status.get("ok") else "offline"
         badge_text = "OK" if entry_status.get("ok") else (t("error_short") if entry_status.get("last_error") else t("waiting"))
+        hostnames_html = "<br>".join(html.escape(hostname) for hostname in entry_hostnames(entry)) or "-"
         rows.append(
             f"""
 <tr>
@@ -1879,7 +1897,7 @@ def index():
 <td>{html.escape(entry['name'])}</td>
 <td>{html.escape(provider_display_name(entry['provider']))}</td>
 <td>{html.escape(ip_mode_display_name(entry.get('ip_mode', 'ipv4')))}</td>
-<td>{html.escape(entry['hostname'])}</td>
+<td>{hostnames_html}</td>
 <td><span class="badge {badge_class}">{badge_text}</span></td>
 <td>{html.escape(entry_status.get('last_public_ipv4', '-'))}</td>
 <td>{html.escape(entry_status.get('last_public_ipv6', '-'))}</td>
@@ -1940,6 +1958,13 @@ def services():
     rows = []
     for entry in entries:
         entry_status = status["entries"].get(entry["id"], {})
+        host_statuses = entry_status.get("hosts", {}) if isinstance(entry_status.get("hosts", {}), dict) else {}
+        host_rows = []
+        for hostname in entry_hostnames(entry):
+            host_status = host_statuses.get(hostname, {})
+            host_result = host_status.get("last_result", "-")
+            host_rows.append(f"{html.escape(hostname)}: {html.escape(str(host_result))}")
+        hostnames_html = "<br>".join(host_rows) or "-"
         rows.append(
             f"""
 <tr>
@@ -1947,7 +1972,7 @@ def services():
 <td>{html.escape(entry['name'])}</td>
 <td>{html.escape(provider_display_name(entry['provider']))}</td>
 <td>{html.escape(ip_mode_display_name(entry.get('ip_mode', 'ipv4')))}</td>
-<td>{html.escape(entry['hostname'])}</td>
+<td>{hostnames_html}</td>
 <td>{html.escape(entry_status.get('last_result', '-'))}</td>
 <td>{html.escape(entry_status.get('last_error', '-'))}</td>
 <td class="table-actions-cell"><div class="table-actions"><a class="btn secondary" href="/services/{entry['id']}/edit">{html.escape(t("edit"))}</a><form method="post" action="/services/run"><input type="hidden" name="entry_id" value="{entry['id']}"><button class="btn secondary" type="submit">{html.escape(t("test"))}</button></form><form method="post" action="/services/delete" onsubmit="return confirm('{html.escape(t("confirm_delete"))}');"><input type="hidden" name="entry_id" value="{entry['id']}"><button class="delete" type="submit">{html.escape(t("delete"))}</button></form></div></td>
@@ -1981,6 +2006,7 @@ def service_form(entry: dict | None = None, error: str = "", secret_override: di
         "provider": "dynu",
         "ip_mode": "dual",
         "hostname": "",
+        "hostnames": [],
     }
     secret = secret_override or (get_entry_secret(entry["id"]) if entry.get("id") else {"username": "", "password": ""})
     masked_hint = t("password_saved_hint") if secret.get("password") else t("password_missing_hint")
@@ -1996,6 +2022,7 @@ def service_form(entry: dict | None = None, error: str = "", secret_override: di
     username_required = " required" if spec["require_username"] else ""
     provider_specs_json = json.dumps(PROVIDER_SPECS)
     username_value = html.escape(secret.get("username", ""))
+    hostnames_value = html.escape("\n".join(entry_hostnames(entry)))
     return f"""
 <h1>{html.escape(title)}</h1>
 <div class="card form-card">
@@ -2003,7 +2030,7 @@ def service_form(entry: dict | None = None, error: str = "", secret_override: di
 <div><label>{html.escape(t("display_name"))}</label><input type="text" name="name" value="{html.escape(entry.get('name', ''))}" required></div>
 <div><label>{html.escape(t("provider"))}</label><select name="provider" data-provider-select>{provider_option_tags(provider)}</select></div>
 <div><label>{html.escape(t("ip_mode"))}</label><select name="ip_mode" data-ip-mode-select>{ip_mode_option_tags(provider, ip_mode)}</select></div>
-<div><label>{html.escape(t("hostname_domain"))}</label><input type="text" name="hostname" value="{html.escape(entry.get('hostname', ''))}" placeholder="{html.escape(hostname_placeholder)}" required data-hostname-input></div>
+<div><label>{html.escape(t("hostname_domain"))}</label><textarea name="hostnames" rows="5" placeholder="{html.escape(hostname_placeholder)}" required data-hostname-input>{hostnames_value}</textarea><p class="muted">Ein Hostname oder eine Domain pro Zeile.</p></div>
 <div class="provider-username-row"{" style='display:none;'" if not spec["show_username"] else ""}><label data-username-label>{html.escape(username_label)}</label><input type="text" name="username" value="{username_value}"{username_required} data-username-input></div>
 <div><label data-password-label>{password_label}</label><input type="password" name="password" value="" data-password-input></div>
 <p class="muted" data-provider-help>{html.escape(provider_help)}</p>
@@ -2075,7 +2102,8 @@ def service_new():
     if request.method == "POST":
         name = (request.form.get("name") or "").strip()
         provider = (request.form.get("provider") or "dynu").strip().lower()
-        hostname = (request.form.get("hostname") or "").strip().lower()
+        hostnames = normalize_hostnames(request.form.get("hostnames") or request.form.get("hostname") or "")
+        hostname = hostnames[0] if hostnames else ""
         username = (request.form.get("username") or "").strip()
         password = request.form.get("password") or ""
         draft_entry = {
@@ -2085,12 +2113,13 @@ def service_new():
             "provider": provider,
             "ip_mode": (request.form.get("ip_mode") or "ipv4").strip().lower(),
             "hostname": hostname,
+            "hostnames": hostnames,
         }
         draft_secret = {"username": username, "password": ""}
         spec = PROVIDER_SPECS.get(provider)
         if not spec:
             error = "Provider aktuell nicht unterstützt."
-        elif not name or not hostname:
+        elif not name or not hostnames:
             error = t("fill_all_fields")
         elif spec["require_username"] and not username:
             error = spec["create_error"]
@@ -2107,13 +2136,14 @@ def service_new():
                     "provider": provider,
                     "ip_mode": (request.form.get("ip_mode") or "ipv4").strip().lower(),
                     "hostname": hostname,
+                    "hostnames": hostnames,
                     "created_at": now_iso(),
                     "updated_at": now_iso(),
                 }
             )
             save_entries(data)
             set_entry_secret(entry_id, username if spec["show_username"] else "", password)
-            write_audit_log(f"service created: {hostname}")
+            write_audit_log(f"service created: {', '.join(hostnames)}")
             return redirect(url_for("services"), code=303)
     return layout(service_form(entry=draft_entry, error=error, secret_override=draft_secret), active="services")
 
@@ -2130,7 +2160,8 @@ def service_edit(entry_id: str):
     if request.method == "POST":
         name = (request.form.get("name") or "").strip()
         provider = (request.form.get("provider") or "dynu").strip().lower()
-        hostname = (request.form.get("hostname") or "").strip().lower()
+        hostnames = normalize_hostnames(request.form.get("hostnames") or request.form.get("hostname") or "")
+        hostname = hostnames[0] if hostnames else ""
         username = (request.form.get("username") or "").strip()
         password = request.form.get("password") or ""
         form_entry = {
@@ -2140,12 +2171,13 @@ def service_edit(entry_id: str):
             "provider": provider,
             "ip_mode": (request.form.get("ip_mode") or "ipv4").strip().lower(),
             "hostname": hostname,
+            "hostnames": hostnames,
         }
         form_secret = {"username": username, "password": ""}
         spec = PROVIDER_SPECS.get(provider)
         if not spec:
             error = "Provider aktuell nicht unterstützt."
-        elif not name or not hostname:
+        elif not name or not hostnames:
             error = t("fill_all_fields")
         elif spec["require_username"] and not username:
             error = spec["update_error"]
@@ -2164,11 +2196,12 @@ def service_edit(entry_id: str):
                     entry["provider"] = provider
                     entry["ip_mode"] = (request.form.get("ip_mode") or "ipv4").strip().lower()
                     entry["hostname"] = hostname
+                    entry["hostnames"] = hostnames
                     entry["enabled"] = request.form.get("enabled") == "on"
                     entry["updated_at"] = now_iso()
                 save_entries(data)
                 set_entry_secret(entry_id, next_username, next_password)
-                write_audit_log(f"service updated: {hostname}")
+                write_audit_log(f"service updated: {', '.join(hostnames)}")
                 return redirect(url_for("services"), code=303)
     return layout(service_form(entry=form_entry, error=error, secret_override=form_secret), active="services")
 
@@ -2182,7 +2215,7 @@ def services_toggle():
         if entry["id"] == entry_id:
             entry["enabled"] = not bool(entry.get("enabled", True))
             entry["updated_at"] = now_iso()
-            write_audit_log(f"service toggled: {entry['hostname']} -> {entry['enabled']}")
+            write_audit_log(f"service toggled: {', '.join(entry_hostnames(entry))} -> {entry['enabled']}")
             break
     save_entries(data)
     if request.headers.get("X-Requested-With") == "fetch":
@@ -2214,7 +2247,7 @@ def services_run():
     return_to = (request.form.get("return_to") or "").strip()
     ok, output = run_panel_update(force=True, entry_id=entry_id)
     entry = find_entry(entry_id)
-    label = entry["hostname"] if entry else entry_id
+    label = ", ".join(entry_hostnames(entry)) if entry else entry_id
     write_audit_log(f"manual service update run: {label} {'ok' if ok else 'error'}")
     if request.headers.get("X-Requested-With") == "fetch":
         return jsonify({"ok": ok, "output": output[:400], "entry_id": entry_id})

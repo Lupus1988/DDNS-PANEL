@@ -16,6 +16,7 @@ from lib.ddns_core import (
     cloudns_update,
     ydns_update,
     ddnss_update,
+    entry_hostnames,
     load_entries,
     load_setup,
     load_status,
@@ -28,7 +29,69 @@ from lib.ddns_core import (
     cloudflare_update,
     duckdns_update,
     dynu_update,
+    netcup_rest_update,
 )
+
+
+SUPPORTED_PROVIDERS = {
+    "dynu",
+    "duckdns",
+    "noip",
+    "cloudflare",
+    "freedns",
+    "dynv6",
+    "desec",
+    "he",
+    "cloudns",
+    "ydns",
+    "ddnss",
+    "netcup_rest",
+}
+
+
+def update_provider(
+    provider: str,
+    hostname: str,
+    username: str,
+    password: str,
+    ip_mode: str,
+    target_ipv4: str,
+    target_ipv6: str,
+    timeout_seconds: int,
+) -> str:
+    if provider == "dynu":
+        return dynu_update(hostname, username, password, target_ipv4, target_ipv6, timeout_seconds)
+    if provider == "duckdns":
+        return duckdns_update(hostname, password, target_ipv4, target_ipv6, timeout_seconds)
+    if provider == "noip":
+        return noip_update(hostname, username, password, target_ipv6 or target_ipv4, timeout_seconds)
+    if provider == "freedns":
+        return freedns_update(hostname, password, ip_mode, timeout_seconds)
+    if provider == "dynv6":
+        return dynv6_update(hostname, password, target_ipv4, target_ipv6, timeout_seconds)
+    if provider == "desec":
+        return desec_update(hostname, password, target_ipv4, target_ipv6, timeout_seconds)
+    if provider == "he":
+        return he_update(hostname, password, target_ipv4, target_ipv6, timeout_seconds)
+    if provider == "cloudns":
+        return cloudns_update(hostname, password, ip_mode, timeout_seconds)
+    if provider == "ydns":
+        return ydns_update(hostname, username, password, target_ipv6 or target_ipv4, timeout_seconds)
+    if provider == "ddnss":
+        return ddnss_update(hostname, username, password, target_ipv4, target_ipv6, timeout_seconds)
+    if provider == "netcup_rest":
+        return netcup_rest_update(hostname, username, password, target_ipv4, target_ipv6, timeout_seconds)
+    if provider == "cloudflare":
+        return cloudflare_update(hostname, username, password, target_ipv4, target_ipv6, timeout_seconds)
+    raise ValueError("Provider aktuell nicht unterstützt.")
+
+
+def host_status(entry_status: dict, hostname: str) -> dict:
+    hosts = entry_status.setdefault("hosts", {})
+    if not isinstance(hosts, dict):
+        hosts = {}
+        entry_status["hosts"] = hosts
+    return hosts.setdefault(hostname, {})
 
 
 def run_update(force: bool = False, entry_id: str = "") -> int:
@@ -98,11 +161,21 @@ def run_update(force: bool = False, entry_id: str = "") -> int:
         for entry in entries:
             current = status["entries"].setdefault(entry["id"], {})
             current["ok"] = True
+            current["last_error"] = ""
             current["last_checked_at"] = now_iso()
             current["last_public_ip"] = public_ipv4 or public_ipv6
             current["last_public_ipv4"] = public_ipv4
             current["last_public_ipv6"] = public_ipv6
             current["last_result"] = "unchanged"
+            for hostname in entry_hostnames(entry):
+                host = host_status(current, hostname)
+                host["ok"] = True
+                host["last_error"] = ""
+                host["last_public_ip"] = public_ipv4 or public_ipv6
+                host["last_public_ipv4"] = public_ipv4
+                host["last_public_ipv6"] = public_ipv6
+                host["last_result"] = "unchanged"
+                host["last_checked_at"] = now_iso()
         save_status(status)
         print(status["last_run_summary"])
         return 0
@@ -114,101 +187,103 @@ def run_update(force: bool = False, entry_id: str = "") -> int:
     error_count = 0
     for entry in entries:
         entry_status = status["entries"].setdefault(entry["id"], {})
+        hostnames = entry_hostnames(entry)
         entry_status["last_checked_at"] = now_iso()
         entry_status["last_public_ip"] = public_ipv4 or public_ipv6
         entry_status["last_public_ipv4"] = public_ipv4
         entry_status["last_public_ipv6"] = public_ipv6
 
+        if not hostnames:
+            entry_status["ok"] = False
+            entry_status["last_result"] = "error"
+            entry_status["last_error"] = "Keine Hostnamen konfiguriert."
+            error_count += 1
+            continue
+
         if not entry.get("enabled", True):
             entry_status["ok"] = True
+            entry_status["last_error"] = ""
             entry_status["last_result"] = "disabled"
+            for hostname in hostnames:
+                host = host_status(entry_status, hostname)
+                host["ok"] = True
+                host["last_error"] = ""
+                host["last_result"] = "disabled"
+                host["last_checked_at"] = now_iso()
             continue
 
         ip_mode = entry.get("ip_mode", "ipv4")
         target_ipv4 = public_ipv4 if ip_mode in {"ipv4", "dual"} else ""
         target_ipv6 = public_ipv6 if ip_mode in {"ipv6", "dual"} else ""
+        validation_error = ""
         if ip_mode == "ipv4" and not target_ipv4:
-            entry_status["ok"] = False
-            entry_status["last_error"] = "Keine öffentliche IPv4-Adresse verfügbar."
-            entry_status["last_result"] = "error"
-            error_count += 1
-            continue
-        if ip_mode == "ipv6" and not target_ipv6:
-            entry_status["ok"] = False
-            entry_status["last_error"] = "Keine öffentliche IPv6-Adresse verfügbar."
-            entry_status["last_result"] = "error"
-            error_count += 1
-            continue
-        if ip_mode == "dual" and (not target_ipv4 or not target_ipv6):
-            entry_status["ok"] = False
-            entry_status["last_error"] = "Für Dual Stack werden öffentliche IPv4 und IPv6 benötigt."
-            entry_status["last_result"] = "error"
-            error_count += 1
-            continue
+            validation_error = "Keine öffentliche IPv4-Adresse verfügbar."
+        elif ip_mode == "ipv6" and not target_ipv6:
+            validation_error = "Keine öffentliche IPv6-Adresse verfügbar."
+        elif ip_mode == "dual" and (not target_ipv4 or not target_ipv6):
+            validation_error = "Für Dual Stack werden öffentliche IPv4 und IPv6 benötigt."
 
         secret = get_entry_secret(entry["id"])
         username = secret.get("username", "").strip()
         password = secret.get("password", "")
-        if entry["provider"] not in {"dynu", "duckdns", "noip", "cloudflare", "freedns", "dynv6", "desec", "he", "cloudns", "ydns", "ddnss"}:
-            entry_status["ok"] = False
-            entry_status["last_error"] = "Provider aktuell nicht unterstützt."
-            error_count += 1
-            continue
-        try:
-            if entry["provider"] == "dynu":
-                if not username or not password:
+        provider = entry["provider"]
+        host_results = []
+        host_errors = []
+        for hostname in hostnames:
+            host = host_status(entry_status, hostname)
+            host["last_checked_at"] = now_iso()
+            host["last_public_ip"] = public_ipv4 or public_ipv6
+            host["last_public_ipv4"] = public_ipv4
+            host["last_public_ipv6"] = public_ipv6
+            try:
+                if validation_error:
+                    raise ValueError(validation_error)
+                if provider not in SUPPORTED_PROVIDERS:
+                    raise ValueError("Provider aktuell nicht unterstützt.")
+                if provider == "dynu" and (not username or not password):
                     raise ValueError("Dynu-Zugangsdaten fehlen.")
-                response = dynu_update(entry["hostname"], username, password, target_ipv4, target_ipv6, setup["request_timeout_seconds"])
-            elif entry["provider"] == "duckdns":
-                if not password:
+                if provider == "duckdns" and not password:
                     raise ValueError("DuckDNS-Token fehlt.")
-                response = duckdns_update(entry["hostname"], password, target_ipv4, target_ipv6, setup["request_timeout_seconds"])
-            elif entry["provider"] == "noip":
-                if not username or not password:
+                if provider == "noip" and (not username or not password):
                     raise ValueError("No-IP-Zugangsdaten fehlen.")
-                response = noip_update(entry["hostname"], username, password, target_ipv6 or target_ipv4, setup["request_timeout_seconds"])
-            elif entry["provider"] == "freedns":
-                if not password:
-                    raise ValueError("FreeDNS-Token oder Update-URL fehlt.")
-                response = freedns_update(entry["hostname"], password, ip_mode, setup["request_timeout_seconds"])
-            elif entry["provider"] == "dynv6":
-                if not password:
-                    raise ValueError("dynv6-Token fehlt.")
-                response = dynv6_update(entry["hostname"], password, target_ipv4, target_ipv6, setup["request_timeout_seconds"])
-            elif entry["provider"] == "desec":
-                if not password:
-                    raise ValueError("deSEC-Token fehlt.")
-                response = desec_update(entry["hostname"], password, target_ipv4, target_ipv6, setup["request_timeout_seconds"])
-            elif entry["provider"] == "he":
-                if not password:
-                    raise ValueError("Hurricane-Electric-Passwort fehlt.")
-                response = he_update(entry["hostname"], password, target_ipv4, target_ipv6, setup["request_timeout_seconds"])
-            elif entry["provider"] == "cloudns":
-                if not password:
-                    raise ValueError("ClouDNS Dynamic URL fehlt.")
-                response = cloudns_update(entry["hostname"], password, ip_mode, setup["request_timeout_seconds"])
-            elif entry["provider"] == "ydns":
-                if not username or not password:
+                if provider in {"freedns", "dynv6", "desec", "he", "cloudns"} and not password:
+                    raise ValueError("Zugangsdaten für den Anbieter fehlen.")
+                if provider == "ydns" and (not username or not password):
                     raise ValueError("YDNS-Zugangsdaten fehlen.")
-                response = ydns_update(entry["hostname"], username, password, target_ipv6 or target_ipv4, setup["request_timeout_seconds"])
-            elif entry["provider"] == "ddnss":
-                if not username or not password:
+                if provider == "ddnss" and (not username or not password):
                     raise ValueError("ddnss.de-Zugangsdaten fehlen.")
-                response = ddnss_update(entry["hostname"], username, password, target_ipv4, target_ipv6, setup["request_timeout_seconds"])
-            else:
-                if not username or not password:
+                if provider == "netcup_rest" and not password:
+                    raise ValueError("Netcup API-Key fehlt.")
+                if provider == "cloudflare" and (not username or not password):
                     raise ValueError("Cloudflare Zone-ID oder API-Token fehlt.")
-                response = cloudflare_update(entry["hostname"], username, password, target_ipv4, target_ipv6, setup["request_timeout_seconds"])
-            entry_status["ok"] = True
-            entry_status["last_error"] = ""
-            entry_status["last_result"] = response
-            entry_status["last_update_at"] = now_iso()
-            ok_count += 1
-        except Exception as exc:
-            entry_status["ok"] = False
-            entry_status["last_error"] = str(exc)
-            entry_status["last_result"] = "error"
+                response = update_provider(
+                    provider,
+                    hostname,
+                    username,
+                    password,
+                    ip_mode,
+                    target_ipv4,
+                    target_ipv6,
+                    setup["request_timeout_seconds"],
+                )
+                host["ok"] = True
+                host["last_error"] = ""
+                host["last_result"] = response
+                host["last_update_at"] = now_iso()
+                host_results.append(f"{hostname}: {response}")
+            except Exception as exc:
+                host["ok"] = False
+                host["last_error"] = str(exc)
+                host["last_result"] = "error"
+                host_errors.append(f"{hostname}: {exc}")
+        entry_status["ok"] = not host_errors
+        entry_status["last_error"] = "; ".join(host_errors)
+        entry_status["last_result"] = "; ".join(host_results) if host_results else "error"
+        entry_status["last_update_at"] = now_iso()
+        if host_errors:
             error_count += 1
+        else:
+            ok_count += 1
 
     summary_parts = []
     if public_ipv4:
