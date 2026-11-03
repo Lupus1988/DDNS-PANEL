@@ -30,6 +30,7 @@ from lib.ddns_core import (
     duckdns_update,
     dynu_update,
     netcup_rest_update,
+    netcup_reconciliation_due,
 )
 
 
@@ -151,34 +152,49 @@ def run_update(force: bool = False, entry_id: str = "") -> int:
         print(status["last_run_summary"])
         return 0
 
-    if setup["only_update_on_change"] and not ip_changed and not force:
+    if not ip_changed and not force:
         unchanged_parts = []
         if public_ipv4:
             unchanged_parts.append(f"IPv4 {public_ipv4}" + (f" via {used_ipv4_source}" if used_ipv4_source else ""))
         if public_ipv6:
             unchanged_parts.append(f"IPv6 {public_ipv6}" + (f" via {used_ipv6_source}" if used_ipv6_source else ""))
-        status["last_run_summary"] = f"Öffentliche IP unverändert ({'; '.join(unchanged_parts)})"
+        entries_to_process = []
+        previous_errors = []
+        checked_at = now_iso()
         for entry in entries:
             current = status["entries"].setdefault(entry["id"], {})
-            current["ok"] = True
-            current["last_error"] = ""
-            current["last_checked_at"] = now_iso()
+            if entry.get("provider") == "netcup_rest":
+                should_process = (
+                    entry.get("enabled", True)
+                    and netcup_reconciliation_due(current.get("last_reconcile_attempt_at"))
+                )
+            else:
+                should_process = not setup["only_update_on_change"]
+            if should_process:
+                entries_to_process.append(entry)
+                continue
+            current["last_checked_at"] = checked_at
             current["last_public_ip"] = public_ipv4 or public_ipv6
             current["last_public_ipv4"] = public_ipv4
             current["last_public_ipv6"] = public_ipv6
-            current["last_result"] = "unchanged"
             for hostname in entry_hostnames(entry):
                 host = host_status(current, hostname)
-                host["ok"] = True
-                host["last_error"] = ""
                 host["last_public_ip"] = public_ipv4 or public_ipv6
                 host["last_public_ipv4"] = public_ipv4
                 host["last_public_ipv6"] = public_ipv6
-                host["last_result"] = "unchanged"
-                host["last_checked_at"] = now_iso()
-        save_status(status)
-        print(status["last_run_summary"])
-        return 0
+                host["last_checked_at"] = checked_at
+            if not current.get("ok", True) and current.get("last_error"):
+                previous_errors.append(
+                    f"{entry.get('name', entry.get('id', 'DDNS'))}: {current['last_error']}"
+                )
+        if not entries_to_process:
+            status["last_run_summary"] = f"Öffentliche IP unverändert ({'; '.join(unchanged_parts)})"
+            if previous_errors:
+                status["last_run_summary"] += f" – letzter Anbieterfehler: {' | '.join(previous_errors)}"
+            save_status(status)
+            print(status["last_run_summary"])
+            return 0
+        entries = entries_to_process
 
     if ip_changed:
         status["last_change_at"] = now_iso()
@@ -227,6 +243,8 @@ def run_update(force: bool = False, entry_id: str = "") -> int:
         username = secret.get("username", "").strip()
         password = secret.get("password", "")
         provider = entry["provider"]
+        if provider == "netcup_rest":
+            entry_status["last_reconcile_attempt_at"] = now_iso()
         host_results = []
         host_errors = []
         for hostname in hostnames:
@@ -290,7 +308,15 @@ def run_update(force: bool = False, entry_id: str = "") -> int:
         summary_parts.append(f"IPv4 {public_ipv4}" + (f" via {used_ipv4_source}" if used_ipv4_source else ""))
     if public_ipv6:
         summary_parts.append(f"IPv6 {public_ipv6}" + (f" via {used_ipv6_source}" if used_ipv6_source else ""))
-    status["last_run_summary"] = f"{'; '.join(summary_parts)} geprüft, {ok_count} erfolgreich, {error_count} Fehler"
+    summary = f"{'; '.join(summary_parts)} geprüft, {ok_count} erfolgreich, {error_count} Fehler"
+    if error_count:
+        error_details = [
+            f"{entry.get('name', entry.get('id', 'DDNS'))}: {status['entries'][entry['id']].get('last_error', '')}"
+            for entry in entries
+            if not status["entries"].get(entry["id"], {}).get("ok", False)
+        ]
+        summary += f" – Fehler: {' | '.join(error_details)}"
+    status["last_run_summary"] = summary
     save_status(status)
     print(status["last_run_summary"])
     return 0 if error_count == 0 else 1

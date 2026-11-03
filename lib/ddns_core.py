@@ -750,96 +750,20 @@ def ddnss_update(hostname: str, username: str, password: str, ipv4: str, ipv6: s
     return body
 
 
-NETCUP_API_BASE = "https://api.netcup.com"
+NETCUP_DDNS_API_URL = "https://customercontrolpanel.de/wsDynDns.php"
+NETCUP_DDNS_MIN_TIMEOUT_SECONDS = 15
+NETCUP_RECONCILIATION_INTERVAL_SECONDS = 3600
 
 
-def _netcup_error_message(data: dict[str, Any]) -> str:
-    for key in ("errors", "messages"):
-        values = data.get(key) or []
-        if not isinstance(values, list):
-            values = [values]
-        for value in values:
-            if isinstance(value, dict):
-                message = value.get("message") or value.get("code")
-            else:
-                message = value
-            if message:
-                return str(message)
-    return "Unbekannter Netcup-API-Fehler."
-
-
-def netcup_api_request(
-    method: str,
-    path: str,
-    api_key: str,
-    timeout_seconds: int,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    api_key = api_key.strip()
-    if not api_key:
-        raise ValueError("Netcup API-Key fehlt.")
-    body = None
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Accept": "application/json",
-        "User-Agent": "ddns-panel/1.0",
-    }
-    if payload is not None:
-        body = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(
-        f"{NETCUP_API_BASE}{path}",
-        data=body,
-        method=method,
-        headers=headers,
-    )
+def netcup_reconciliation_due(last_attempt_at: str, now: datetime | None = None) -> bool:
+    if not last_attempt_at:
+        return True
     try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            raw = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        try:
-            data = json.loads(exc.read().decode("utf-8"))
-        except Exception:
-            data = {}
-        message = _netcup_error_message(data) if isinstance(data, dict) else "HTTP-Fehler"
-        raise RuntimeError(f"Netcup-API-Fehler ({exc.code}): {message}") from None
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Netcup-API nicht erreichbar: {exc.reason}") from None
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        raise RuntimeError("Netcup-API lieferte keine gültige JSON-Antwort.") from None
-    if not isinstance(data, dict):
-        raise RuntimeError("Netcup-API-Antwort ungültig.")
-    if not data.get("success", False):
-        raise RuntimeError(f"Netcup-API-Fehler: {_netcup_error_message(data)}")
-    return data
-
-
-def _netcup_result_list(data: dict[str, Any]) -> list[dict[str, Any]]:
-    result = data.get("result") or []
-    if not isinstance(result, list):
-        return []
-    return [item for item in result if isinstance(item, dict)]
-
-
-def _netcup_result_object(data: dict[str, Any]) -> dict[str, Any]:
-    result = data.get("result")
-    if not isinstance(result, dict):
-        raise RuntimeError("Netcup-API lieferte kein gültiges Ergebnis.")
-    return result
-
-
-def _netcup_relative_record_name(hostname: str, zone: str) -> str:
-    hostname = hostname.strip().lower().rstrip(".")
-    zone = zone.strip().lower().rstrip(".")
-    if hostname == zone:
-        return "@"
-    suffix = f".{zone}"
-    if not hostname.endswith(suffix):
-        raise ValueError(f"Hostname {hostname} gehört nicht zur Zone {zone}.")
-    relative = hostname[: -len(suffix)].strip(".")
-    return relative or "@"
+        previous = datetime.strptime(str(last_attempt_at), "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return True
+    current = now or datetime.now()
+    return (current - previous).total_seconds() >= NETCUP_RECONCILIATION_INTERVAL_SECONDS
 
 
 def netcup_rest_update(
@@ -855,73 +779,65 @@ def netcup_rest_update(
     if not hostname:
         raise ValueError("Netcup-Hostname fehlt.")
     if not ipv4:
-        raise ValueError("Netcup REST unterstützt im DDNS-Panel derzeit IPv4.")
+        raise ValueError("Netcup DynDNS unterstützt im DDNS-Panel derzeit IPv4.")
 
-    domains = _netcup_result_list(netcup_api_request("GET", "/v1/domain", api_key, timeout_seconds))
-    candidates = []
-    for domain in domains:
-        zone = str(domain.get("fqdn", "")).strip().lower().rstrip(".")
-        if not zone or domain.get("isDnsManaged") is False:
-            continue
-        if hostname == zone or hostname.endswith(f".{zone}"):
-            candidates.append((len(zone), zone, domain))
-    if not candidates:
-        raise RuntimeError(f"Keine verwaltete Netcup-DNS-Zone für {hostname} gefunden.")
-    _, zone, domain = max(candidates, key=lambda item: item[0])
-    domain_id = str(domain.get("id", "")).strip()
-    if not domain_id:
-        raise RuntimeError("Netcup-Zonen-ID fehlt.")
-    relative_name = _netcup_relative_record_name(hostname, zone)
-
-    revision_path = ""
+    timeout_seconds = max(int(timeout_seconds), NETCUP_DDNS_MIN_TIMEOUT_SECONDS)
+    api_key = api_key.strip()
+    if not api_key:
+        raise ValueError("Netcup API-Key fehlt.")
     try:
-        revision = _netcup_result_object(
-            netcup_api_request("POST", f"/v1/domain/{domain_id}/dns/revision", api_key, timeout_seconds)
-        )
-        revision_id = str(revision.get("identifier", "")).strip()
-        if not revision_id:
-            raise RuntimeError("Netcup-DNS-Revision-ID fehlt.")
-        revision_path = f"/v1/domain/{domain_id}/dns/revision/{urllib.parse.quote(revision_id, safe='')}"
-        records = _netcup_result_list(
-            netcup_api_request("GET", f"{revision_path}/record", api_key, timeout_seconds)
-        )
-        existing = [
-            record
-            for record in records
-            if str(record.get("name", "")).strip().lower() == relative_name.lower()
-            and str(record.get("type", "")).strip().upper() == "A"
-        ]
-        ttl = int(existing[0].get("ttl", 3600) or 3600) if existing else 3600
-        if len(existing) == 1 and str(existing[0].get("rdata", "")).strip() == ipv4:
-            netcup_api_request("DELETE", revision_path, api_key, timeout_seconds)
-            return f"unchanged A {hostname} -> {ipv4}"
-        delete = [
-            {
-                "name": str(record.get("name", relative_name)),
-                "type": "A",
-                "rdata": str(record.get("rdata", "")),
-                "ttl": int(record.get("ttl", ttl) or ttl),
-            }
-            for record in existing
-            if str(record.get("rdata", "")).strip()
-        ]
-        create = [{"name": relative_name, "type": "A", "rdata": ipv4, "ttl": ttl}]
-        netcup_api_request(
-            "POST",
-            f"{revision_path}/changeset",
-            api_key,
-            timeout_seconds,
-            payload={"autoCommit": True, "strict": True, "create": create, "delete": delete},
-        )
-        action = "updated" if existing else "created"
-        return f"{action} A {hostname} -> {ipv4}"
-    except Exception:
-        if revision_path:
-            try:
-                netcup_api_request("DELETE", revision_path, api_key, timeout_seconds)
-            except Exception:
-                pass
-        raise
+        ipaddress.IPv4Address(ipv4)
+    except ipaddress.AddressValueError:
+        raise ValueError("Netcup erwartet eine gültige öffentliche IPv4-Adresse.") from None
+
+    body = urllib.parse.urlencode(
+        {
+            "action": "update",
+            "token": api_key,
+            "fqdn": hostname,
+            "ipv4Address": ipv4,
+        }
+    ).encode("ascii")
+    request = urllib.request.Request(
+        NETCUP_DDNS_API_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "ddns-panel/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            raw = response.read().decode("utf-8")
+    except TimeoutError:
+        raise RuntimeError(
+            f"Netcup DynDNS timeout für {hostname} nach {timeout_seconds} Sekunden."
+        ) from None
+    except urllib.error.HTTPError as exc:
+        try:
+            data = json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            data = {}
+        message = str(data.get("message") or "HTTP-Fehler").replace(api_key, "[redacted]")
+        raise RuntimeError(
+            f"Netcup DynDNS für {hostname} fehlgeschlagen (HTTP {exc.code}): {message}"
+        ) from None
+    except urllib.error.URLError as exc:
+        reason = str(exc.reason).replace(api_key, "[redacted]")
+        raise RuntimeError(f"Netcup DynDNS für {hostname} nicht erreichbar: {reason}") from None
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        raise RuntimeError("Netcup DynDNS lieferte keine gültige JSON-Antwort.") from None
+    if not isinstance(data, dict):
+        raise RuntimeError("Netcup DynDNS-Antwort ungültig.")
+    message = str(data.get("message") or "Unbekannte Netcup-DynDNS-Antwort.")
+    if str(data.get("status", "")).strip().lower() != "success":
+        raise RuntimeError(f"Netcup DynDNS für {hostname} fehlgeschlagen: {message.replace(api_key, '[redacted]')}")
+    return f"Netcup CloudDNS: {message} ({hostname} -> {ipv4})"
 
 
 def cloudflare_api_request(
