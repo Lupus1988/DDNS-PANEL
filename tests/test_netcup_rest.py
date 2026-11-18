@@ -36,7 +36,7 @@ class NetcupRestUpdateTests(unittest.TestCase):
             )
 
         request = urlopen.call_args.args[0]
-        self.assertEqual(request.full_url, "https://customercontrolpanel.de/wsDynDns.php")
+        self.assertEqual(request.full_url, "https://www.customercontrolpanel.de/wsDynDns.php")
         self.assertEqual(request.get_method(), "POST")
         self.assertNotIn("test-api-key", request.full_url)
         self.assertEqual(

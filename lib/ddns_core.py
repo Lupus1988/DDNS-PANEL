@@ -750,7 +750,7 @@ def ddnss_update(hostname: str, username: str, password: str, ipv4: str, ipv6: s
     return body
 
 
-NETCUP_DDNS_API_URL = "https://customercontrolpanel.de/wsDynDns.php"
+NETCUP_DDNS_API_URL = "https://www.customercontrolpanel.de/wsDynDns.php"
 NETCUP_DDNS_MIN_TIMEOUT_SECONDS = 15
 NETCUP_RECONCILIATION_INTERVAL_SECONDS = 3600
 
